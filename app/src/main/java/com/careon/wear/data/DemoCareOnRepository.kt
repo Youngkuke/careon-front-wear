@@ -4,6 +4,35 @@ import kotlinx.coroutines.delay
 import java.time.Instant
 import java.util.UUID
 
+enum class LocationSource { CURRENT, LAST_KNOWN }
+enum class LocationStatus { CURRENT, LAST_KNOWN, UNAVAILABLE, PERMISSION_DENIED, GPS_DISABLED }
+
+data class LocationSnapshot(
+    val latitude: Double,
+    val longitude: Double,
+    val accuracyMeters: Float,
+    val capturedAt: Instant,
+    val source: LocationSource,
+)
+
+data class SafeZone(
+    val id: Long,
+    val name: String,
+    val latitude: Double,
+    val longitude: Double,
+    val radiusMeters: Double,
+    val enabled: Boolean = true,
+)
+
+enum class SafeZoneStatus { UNKNOWN, INSIDE, OUTSIDE_CANDIDATE, OUTSIDE_CONFIRMED, USER_OKAY, NEED_HELP, NO_RESPONSE }
+
+data class SafeZoneEvent(val id: String, val status: SafeZoneStatus, val location: LocationSnapshot)
+
+data class LiveLocationTracking(
+    val enabled: Boolean,
+    val intervalSeconds: Int = 10,
+)
+
 data class WearProfile(
     val caredId: Long,
     val displayName: String,
@@ -42,17 +71,28 @@ data class EmergencyEvent(
     val requestedAt: Instant,
     val status: EmergencyStatus,
     val acknowledgedByName: String? = null,
+    val location: LocationSnapshot? = null,
 )
 
 interface CareOnRepository {
     suspend fun pair(pairingCode: String): Result<WearProfile>
+    suspend fun restoreSession(): WearProfile? = null
     suspend fun measureHeartRate(bpm: Int): HeartRateReading
     suspend fun createEmergency(
         trigger: EmergencyTrigger,
         heartRateBpm: Int?,
+        location: LocationSnapshot? = null,
+        locationStatus: LocationStatus = if (location == null) LocationStatus.UNAVAILABLE else LocationStatus.valueOf(location.source.name),
     ): EmergencyEvent
 
     suspend fun getEmergency(eventId: String): EmergencyEvent
+    suspend fun getSafeZone(): SafeZone? = null
+    suspend fun createSafeZoneEvent(status: SafeZoneStatus, location: LocationSnapshot): SafeZoneEvent =
+        SafeZoneEvent(UUID.randomUUID().toString(), status, location)
+    suspend fun respondToSafeZoneEvent(eventId: String, response: SafeZoneStatus): SafeZoneEvent =
+        throw UnsupportedOperationException("Not implemented")
+    suspend fun getLiveLocationTracking(): LiveLocationTracking = LiveLocationTracking(enabled = false)
+    suspend fun uploadLiveLocation(location: LocationSnapshot) = Unit
 }
 
 /**
@@ -86,6 +126,8 @@ class DemoCareOnRepository : CareOnRepository {
     override suspend fun createEmergency(
         trigger: EmergencyTrigger,
         heartRateBpm: Int?,
+        location: LocationSnapshot?,
+        locationStatus: LocationStatus,
     ): EmergencyEvent {
         delay(550)
         val event = EmergencyEvent(
@@ -94,10 +136,19 @@ class DemoCareOnRepository : CareOnRepository {
             heartRateBpm = heartRateBpm,
             requestedAt = Instant.now(),
             status = EmergencyStatus.PENDING,
+            location = location,
         )
         emergencies[event.id] = event
         return event
     }
+
+    override suspend fun getSafeZone() = SafeZone(
+        id = 31,
+        name = "집",
+        latitude = 37.4965,
+        longitude = 126.9572,
+        radiusMeters = 150.0,
+    )
 
     override suspend fun getEmergency(eventId: String): EmergencyEvent {
         delay(150)
