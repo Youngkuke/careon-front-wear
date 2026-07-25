@@ -39,6 +39,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalContext
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.Manifest
+import android.os.Build
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -60,9 +67,11 @@ import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.OutlinedButton
 import androidx.wear.compose.material3.Text
-import com.careon.wear.data.DemoCareOnRepository
+import com.careon.wear.data.CareOnRepository
 import com.careon.wear.data.EmergencyStatus
 import com.careon.wear.data.HeartRateAssessment
+import com.careon.wear.location.FusedCareOnLocationClient
+import com.careon.wear.sensor.AndroidHeartRateSensorClient
 import com.careon.wear.R
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
@@ -76,8 +85,27 @@ private data class WearLayoutScale(val multiplier: Float) {
 private val LocalWearLayoutScale = staticCompositionLocalOf { WearLayoutScale(1f) }
 
 @Composable
-fun CareOnWearApp(viewModel: CareOnWearViewModel = viewModel()) {
+fun CareOnWearApp(repository: CareOnRepository? = null) {
+    val viewModel: CareOnWearViewModel = if (repository == null) viewModel() else viewModel(factory = CareOnWearViewModelFactory(repository))
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val locationPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+        viewModel.onLocationPermission(permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true || permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true)
+    }
+    val heartRatePermission = if (Build.VERSION.SDK_INT >= 36) "android.permission.health.READ_HEART_RATE" else Manifest.permission.BODY_SENSORS
+    val heartRatePermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        viewModel.onHeartRatePermission(granted)
+    }
+    LaunchedEffect(context) {
+        viewModel.setLocationClient(FusedCareOnLocationClient(context))
+        viewModel.setHeartRateSensorClient(AndroidHeartRateSensorClient(context))
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) viewModel.onLocationPermission(true)
+        if (ContextCompat.checkSelfPermission(context, heartRatePermission) == PackageManager.PERMISSION_GRANTED) viewModel.onHeartRatePermission(true)
+    }
+    LaunchedEffect(state.requestHeartRatePermission) {
+        if (state.requestHeartRatePermission) heartRatePermissionLauncher.launch(heartRatePermission)
+    }
     var showLaunchLogo by rememberSaveable { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
@@ -106,7 +134,7 @@ fun CareOnWearApp(viewModel: CareOnWearViewModel = viewModel()) {
             // A new destination owns a new scroll state, so it always opens at the top.
             key(state.screen) {
                 if (state.screen == WearScreen.SOS) {
-                    SosScreen(error = state.actionError, onConfirmed = viewModel::requestManualSos)
+                    SosScreen(error = state.actionError, locationMessage = state.locationMessage, isFetchingLocation = state.isFetchingLocation, onEnter = viewModel::prepareSosLocation, onConfirmed = viewModel::requestManualSos)
                 } else if (state.screen == WearScreen.WAITING) {
                     WaitingScreen(status = state.emergency?.status ?: EmergencyStatus.PENDING)
                 } else if (state.screen == WearScreen.ACKNOWLEDGED) {
@@ -117,16 +145,15 @@ fun CareOnWearApp(viewModel: CareOnWearViewModel = viewModel()) {
 
                 WearScreen.HOME -> HomeScreen(
                     latestBpm = state.latestReading?.bpm,
-                    demoBpm = state.demoBpm,
                     error = state.actionError,
-                    onToggleDemoHeartRate = viewModel::toggleDemoHeartRate,
                     onMeasure = viewModel::measureHeartRate,
                     onOpenSos = viewModel::openSos,
+                    onDemoSafeZoneExit = viewModel::showDemoSafeZoneExit,
                 )
 
                 WearScreen.MEASURING -> MeasuringScreen()
                 WearScreen.RESULT -> ResultScreen(
-                    bpm = state.latestReading?.bpm ?: state.demoBpm,
+                    bpm = state.latestReading?.bpm ?: 0,
                     assessment = state.assessment ?: HeartRateAssessment.NORMAL,
                     onOkay = viewModel::sayOkay,
                     onOpenCheckIn = viewModel::openCheckIn,
@@ -141,6 +168,11 @@ fun CareOnWearApp(viewModel: CareOnWearViewModel = viewModel()) {
                 WearScreen.WAITING -> Unit
 
                 WearScreen.ACKNOWLEDGED -> Unit
+                WearScreen.LOCATION_PERMISSION -> LocationPermissionScreen(
+                    onAllow = { locationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)) },
+                    onSkip = { viewModel.onLocationPermission(false) },
+                )
+                WearScreen.SAFE_ZONE_EXIT -> SafeZoneExitScreen(onOkay = viewModel::confirmSafeZoneOkay, onNeedHelp = viewModel::requestHelpFromSafeZone)
                     }
                 }
             }
@@ -213,7 +245,7 @@ private fun PrimaryButton(text: String, enabled: Boolean = true, onClick: () -> 
 private fun SoftButton(text: String, onClick: () -> Unit) {
     val scale = LocalWearLayoutScale.current
     FilledTonalButton(onClick = onClick, modifier = Modifier.fillMaxWidth(0.76f).height(scale.size(42.dp))) {
-        Text(text, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, color = CareOnWearColors.PrimaryDark)
+        Text(text, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, color = CareOnWearColors.PrimaryDark)
     }
 }
 
@@ -264,7 +296,6 @@ private fun PairingScreen(code: String, error: String?, isPairing: Boolean, onDi
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(code.padEnd(6, '•').chunked(3).joinToString("  "), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = CareOnWearColors.PrimaryDark)
-            Text("DEMO: ${DemoCareOnRepository.DEMO_PAIRING_CODE}", color = CareOnWearColors.Muted, style = MaterialTheme.typography.labelSmall)
         }
         if (error != null) {
             Spacer(Modifier.height(scale.size(4.dp)))
@@ -341,7 +372,7 @@ private fun RowScope.ConnectKeyButton(enabled: Boolean, isPairing: Boolean, onCl
 }
 
 @Composable
-private fun HomeScreen(latestBpm: Int?, demoBpm: Int, error: String?, onToggleDemoHeartRate: () -> Unit, onMeasure: () -> Unit, onOpenSos: () -> Unit) {
+private fun HomeScreen(latestBpm: Int?, error: String?, onMeasure: () -> Unit, onOpenSos: () -> Unit, onDemoSafeZoneExit: () -> Unit) {
     val scale = LocalWearLayoutScale.current
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("최근 심박수", style = MaterialTheme.typography.labelSmall, color = CareOnWearColors.Muted)
@@ -360,8 +391,8 @@ private fun HomeScreen(latestBpm: Int?, demoBpm: Int, error: String?, onToggleDe
     Spacer(Modifier.height(scale.size(7.dp)))
     DangerButton("긴급 도움", onClick = onOpenSos)
     Spacer(Modifier.height(scale.size(8.dp)))
-    OutlinedButton(onClick = onToggleDemoHeartRate, modifier = Modifier.height(scale.size(30.dp)), border = BorderStroke(scale.size(1.dp), CareOnWearColors.Line)) {
-        Text("다음 데모값 $demoBpm", style = MaterialTheme.typography.labelSmall, color = CareOnWearColors.Text)
+    OutlinedButton(onClick = onDemoSafeZoneExit, modifier = Modifier.height(scale.size(30.dp)), border = BorderStroke(scale.size(1.dp), CareOnWearColors.Line)) {
+        Text("안심 구역 이탈 데모", style = MaterialTheme.typography.labelSmall, color = CareOnWearColors.Text)
     }
     if (error != null) {
         Spacer(Modifier.height(scale.size(5.dp)))
@@ -431,10 +462,11 @@ private fun CheckInScreen(onOkay: () -> Unit, onNeedHelp: () -> Unit) {
 }
 
 @Composable
-private fun SosScreen(error: String?, onConfirmed: () -> Unit) {
+private fun SosScreen(error: String?, locationMessage: String, isFetchingLocation: Boolean, onEnter: () -> Unit, onConfirmed: () -> Unit) {
     val scale = LocalWearLayoutScale.current
     var isPressing by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(Unit) { onEnter() }
     LaunchedEffect(isPressing) {
         if (!isPressing) { progress = 0f; return@LaunchedEffect }
         repeat(30) { index -> delay(100); progress = (index + 1) / 30f }
@@ -465,6 +497,8 @@ private fun SosScreen(error: String?, onConfirmed: () -> Unit) {
             )
             Spacer(Modifier.height(scale.size(10.dp)))
             DemoProgress(modifier = Modifier.fillMaxWidth(), progress = progress, color = CareOnWearColors.Danger)
+            Spacer(Modifier.height(scale.size(7.dp)))
+            Text(if (isFetchingLocation) "위치 확인 중…" else locationMessage, color = CareOnWearColors.Muted, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
             if (isPressing) {
                 Spacer(Modifier.height(scale.size(7.dp)))
                 Text("${(progress * 3).toInt() + 1}초 유지", color = CareOnWearColors.Danger, fontWeight = FontWeight.Bold)
@@ -474,6 +508,49 @@ private fun SosScreen(error: String?, onConfirmed: () -> Unit) {
                 Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center)
             }
         }
+    }
+}
+
+@Composable
+private fun LocationPermissionScreen(onAllow: () -> Unit, onSkip: () -> Unit) {
+    val scale = LocalWearLayoutScale.current
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                "위치를 사용할까요?",
+                color = MaterialTheme.colorScheme.onBackground,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(scale.size(5.dp)))
+            Text(
+                "긴급 도움 요청과\n안심 구역 확인에만 사용해요",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 10.sp,
+                lineHeight = 13.sp,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(scale.size(18.dp)))
+            PrimaryButton("위치 허용", onClick = onAllow)
+            Spacer(Modifier.height(scale.size(8.dp)))
+            SoftButton("나중에", onClick = onSkip)
+        }
+    }
+}
+
+@Composable
+private fun SafeZoneExitScreen(onOkay: () -> Unit, onNeedHelp: () -> Unit) {
+    val scale = LocalWearLayoutScale.current
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        PageTitle("안심 구역을\n벗어났어요", "현재 위치를 보호자에게 알릴까요?")
+        Spacer(Modifier.height(scale.size(18.dp)))
+        PrimaryButton("괜찮아요", onClick = onOkay)
+        Spacer(Modifier.height(scale.size(8.dp)))
+        DangerButton("도움이\n필요해요", tall = true, onClick = onNeedHelp)
     }
 }
 
