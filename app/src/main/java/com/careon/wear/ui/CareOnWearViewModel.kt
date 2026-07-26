@@ -11,6 +11,7 @@ import com.careon.wear.data.EmergencyTrigger
 import com.careon.wear.data.HeartRateAssessment
 import com.careon.wear.data.HeartRateReading
 import com.careon.wear.data.WearProfile
+import com.careon.wear.data.WearSessionExpiredException
 import com.careon.wear.data.assessHeartRate
 import com.careon.wear.data.LocationSnapshot
 import com.careon.wear.data.LocationStatus
@@ -74,10 +75,14 @@ class CareOnWearViewModel(
     private var emergencyPollingJob: Job? = null
     private var automaticHeartRateJob: Job? = null
     private var liveLocationTrackingJob: Job? = null
+    private var safeZoneMonitoringJob: Job? = null
+    private var safeZoneResponseTimeoutJob: Job? = null
     private var locationClient: CareOnLocationClient = DemoLocationClient()
     private var heartRateSensorClient: HeartRateSensorClient? = null
     private var heartRateTimeoutJob: Job? = null
     private val safeZoneEvaluator = SafeZoneEvaluator()
+    private var monitoredZoneKey: String? = null
+    private var departureConfirmed = false
 
     init {
         restoreSession()
@@ -126,8 +131,10 @@ class CareOnWearViewModel(
         if (granted) {
             refreshLocation()
             startLiveLocationTracking()
+            startSafeZoneMonitoring()
         } else {
             liveLocationTrackingJob?.cancel()
+            safeZoneMonitoringJob?.cancel()
         }
     }
 
@@ -305,22 +312,86 @@ class CareOnWearViewModel(
     }
 
     private fun loadSafeZone() = viewModelScope.launch {
-        mutableState.update { it.copy(safeZone = repository.getSafeZone()) }
+        val zone = runCatching { repository.getSafeZone() }.getOrNull()
+        updateSafeZone(zone)
+        startSafeZoneMonitoring()
     }
 
-    /** Enables repeatable emulator demos without creating a production background tracker. */
-    fun showDemoSafeZoneExit() {
-        val location = state.value.latestLocation ?: return
-        mutableState.update { it.copy(screen = WearScreen.SAFE_ZONE_EXIT, safeZoneStatus = safeZoneEvaluator.forceDemoOutside()) }
+    /**
+     * Foreground-only automatic departure detection. A location is sampled every 15 seconds;
+     * SafeZoneEvaluator confirms only after two outside samples spanning at least 30 seconds.
+     * A confirmed departure is latched until the watch returns inside, preventing duplicate
+     * server events for the same trip outside the zone.
+     */
+    private fun startSafeZoneMonitoring() {
+        safeZoneMonitoringJob?.cancel()
+        if (!state.value.locationGranted || state.value.profile == null) return
+
+        safeZoneMonitoringJob = viewModelScope.launch {
+            while (true) {
+                val zone = runCatching { repository.getSafeZone() }.getOrNull()
+                updateSafeZone(zone)
+                if (zone?.enabled == true) {
+                    when (val locationResult = locationClient.getLocation()) {
+                        is LocationResult.Available -> evaluateSafeZone(zone, locationResult.snapshot)
+                        LocationResult.GpsDisabled -> mutableState.update { it.copy(locationStatus = LocationStatus.GPS_DISABLED, locationMessage = "GPS를 사용할 수 없어요") }
+                        LocationResult.Unavailable -> Unit // A failed sample must not be treated as leaving the zone.
+                    }
+                }
+                delay(SAFE_ZONE_SAMPLE_INTERVAL_MILLIS)
+            }
+        }
+    }
+
+    private fun updateSafeZone(zone: SafeZone?) {
+        val key = zone?.takeIf { it.enabled }?.let { "${it.id}:${it.latitude}:${it.longitude}:${it.radiusMeters}" }
+        if (key != monitoredZoneKey) {
+            monitoredZoneKey = key
+            departureConfirmed = false
+            safeZoneEvaluator.reset()
+            mutableState.update { it.copy(safeZoneEvent = null, safeZoneStatus = SafeZoneStatus.UNKNOWN) }
+        }
+        mutableState.update { it.copy(safeZone = zone) }
+    }
+
+    private fun evaluateSafeZone(zone: SafeZone, location: LocationSnapshot) {
+        // Accuracy wider than the smallest supported zone cannot produce a reliable departure.
+        if (location.accuracyMeters > MAX_SAFE_ZONE_ACCURACY_METERS) return
+        val status = safeZoneEvaluator.evaluate(zone, location)
+        mutableState.update {
+            it.copy(
+                latestLocation = location,
+                locationStatus = if (location.source.name == "CURRENT") LocationStatus.CURRENT else LocationStatus.LAST_KNOWN,
+                safeZoneStatus = status,
+            )
+        }
+        if (status == SafeZoneStatus.INSIDE) {
+            departureConfirmed = false
+            return
+        }
+        if (status != SafeZoneStatus.OUTSIDE_CONFIRMED || departureConfirmed) return
+
+        departureConfirmed = true
         viewModelScope.launch {
             runCatching { repository.createSafeZoneEvent(SafeZoneStatus.OUTSIDE_CONFIRMED, location) }
-                .onSuccess { event -> mutableState.update { it.copy(safeZoneEvent = event) } }
-                .onFailure { error -> mutableState.update { it.copy(actionError = error.message) } }
+                .onSuccess { event ->
+                    mutableState.update { it.copy(screen = WearScreen.SAFE_ZONE_EXIT, safeZoneEvent = event) }
+                    startSafeZoneResponseTimeout(event)
+                }
+                .onFailure { error ->
+                    // Permit another confirmed sampling cycle after a transport failure.
+                    departureConfirmed = false
+                    mutableState.update { it.copy(actionError = error.message ?: "안심 구역 이탈을 알리지 못했어요.") }
+                }
         }
-        viewModelScope.launch {
+    }
+
+    private fun startSafeZoneResponseTimeout(event: SafeZoneEvent) {
+        safeZoneResponseTimeoutJob?.cancel()
+        safeZoneResponseTimeoutJob = viewModelScope.launch {
             delay(SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS)
-            if (state.value.screen == WearScreen.SAFE_ZONE_EXIT) {
-                state.value.safeZoneEvent?.let { event -> runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NO_RESPONSE) } }
+            if (state.value.screen == WearScreen.SAFE_ZONE_EXIT && state.value.safeZoneEvent?.id == event.id) {
+                runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NO_RESPONSE) }
                 mutableState.update { it.copy(screen = WearScreen.HOME, safeZoneStatus = SafeZoneStatus.NO_RESPONSE) }
             }
         }
@@ -329,11 +400,13 @@ class CareOnWearViewModel(
     fun confirmSafeZoneOkay() {
         val event = state.value.safeZoneEvent
         if (event != null) viewModelScope.launch { runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.USER_OKAY) } }
+        safeZoneResponseTimeoutJob?.cancel()
         mutableState.update { it.copy(screen = WearScreen.HOME, safeZoneStatus = SafeZoneStatus.USER_OKAY) }
     }
 
     fun requestHelpFromSafeZone() {
         state.value.safeZoneEvent?.let { event -> viewModelScope.launch { runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NEED_HELP) } } }
+        safeZoneResponseTimeoutJob?.cancel()
         createEmergency(EmergencyTrigger.MANUAL_SOS, state.value.latestReading?.bpm)
     }
 
@@ -363,9 +436,20 @@ class CareOnWearViewModel(
         emergencyPollingJob?.cancel()
         automaticHeartRateJob?.cancel()
         emergencyPollingJob = viewModelScope.launch {
+            var retryDelayMillis = EMERGENCY_POLL_INTERVAL_MILLIS
             while (true) {
-                delay(1_000)
-                val event = repository.getEmergency(eventId)
+                delay(retryDelayMillis)
+                val event = try {
+                    repository.getEmergency(eventId)
+                } catch (error: WearSessionExpiredException) {
+                    handleExpiredSession(error)
+                    return@launch
+                } catch (_: Exception) {
+                    // Keep the pending SOS visible and retry when connectivity returns.
+                    retryDelayMillis = (retryDelayMillis * 2).coerceAtMost(MAX_EMERGENCY_POLL_RETRY_MILLIS)
+                    continue
+                }
+                retryDelayMillis = EMERGENCY_POLL_INTERVAL_MILLIS
                 mutableState.update { it.copy(emergency = event) }
 
                 if (event.status == EmergencyStatus.ACKNOWLEDGED) {
@@ -373,6 +457,24 @@ class CareOnWearViewModel(
                     return@launch
                 }
             }
+        }
+    }
+
+    private fun handleExpiredSession(error: WearSessionExpiredException) {
+        emergencyPollingJob?.cancel()
+        liveLocationTrackingJob?.cancel()
+        safeZoneMonitoringJob?.cancel()
+        repository.clearSession()
+        mutableState.update {
+            it.copy(
+                screen = WearScreen.PAIRING,
+                profile = null,
+                pairingCode = "",
+                pairingError = error.message,
+                emergency = null,
+                safeZone = null,
+                safeZoneEvent = null,
+            )
         }
     }
 
@@ -387,6 +489,8 @@ class CareOnWearViewModel(
         emergencyPollingJob?.cancel()
         heartRateTimeoutJob?.cancel()
         liveLocationTrackingJob?.cancel()
+        safeZoneMonitoringJob?.cancel()
+        safeZoneResponseTimeoutJob?.cancel()
         heartRateSensorClient?.cancelReading()
         super.onCleared()
     }
@@ -394,7 +498,11 @@ class CareOnWearViewModel(
     private companion object {
         const val AUTOMATIC_HEART_RATE_INTERVAL_MILLIS = 30_000L
         const val SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS = 30_000L
+        const val SAFE_ZONE_SAMPLE_INTERVAL_MILLIS = 15_000L
+        const val MAX_SAFE_ZONE_ACCURACY_METERS = 100f
         const val LIVE_LOCATION_STATUS_RETRY_SECONDS = 10
+        const val EMERGENCY_POLL_INTERVAL_MILLIS = 1_000L
+        const val MAX_EMERGENCY_POLL_RETRY_MILLIS = 16_000L
     }
 }
 

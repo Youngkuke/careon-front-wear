@@ -148,7 +148,6 @@ fun CareOnWearApp(repository: CareOnRepository? = null) {
                     error = state.actionError,
                     onMeasure = viewModel::measureHeartRate,
                     onOpenSos = viewModel::openSos,
-                    onDemoSafeZoneExit = viewModel::showDemoSafeZoneExit,
                 )
 
                 WearScreen.MEASURING -> MeasuringScreen()
@@ -372,7 +371,7 @@ private fun RowScope.ConnectKeyButton(enabled: Boolean, isPairing: Boolean, onCl
 }
 
 @Composable
-private fun HomeScreen(latestBpm: Int?, error: String?, onMeasure: () -> Unit, onOpenSos: () -> Unit, onDemoSafeZoneExit: () -> Unit) {
+private fun HomeScreen(latestBpm: Int?, error: String?, onMeasure: () -> Unit, onOpenSos: () -> Unit) {
     val scale = LocalWearLayoutScale.current
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("최근 심박수", style = MaterialTheme.typography.labelSmall, color = CareOnWearColors.Muted)
@@ -390,10 +389,6 @@ private fun HomeScreen(latestBpm: Int?, error: String?, onMeasure: () -> Unit, o
     PrimaryButton("심박수 확인", onClick = onMeasure)
     Spacer(Modifier.height(scale.size(7.dp)))
     DangerButton("긴급 도움", onClick = onOpenSos)
-    Spacer(Modifier.height(scale.size(8.dp)))
-    OutlinedButton(onClick = onDemoSafeZoneExit, modifier = Modifier.height(scale.size(30.dp)), border = BorderStroke(scale.size(1.dp), CareOnWearColors.Line)) {
-        Text("안심 구역 이탈 데모", style = MaterialTheme.typography.labelSmall, color = CareOnWearColors.Text)
-    }
     if (error != null) {
         Spacer(Modifier.height(scale.size(5.dp)))
         Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.Center)
