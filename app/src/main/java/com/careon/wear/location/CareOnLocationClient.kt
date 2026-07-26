@@ -3,6 +3,7 @@ package com.careon.wear.location
 import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
+import android.location.LocationManager
 import com.careon.wear.data.LocationSnapshot
 import com.careon.wear.data.LocationSource
 import com.google.android.gms.location.CurrentLocationRequest
@@ -26,9 +27,18 @@ sealed interface LocationResult {
 
 class FusedCareOnLocationClient(context: Context) : CareOnLocationClient {
     private val client = LocationServices.getFusedLocationProviderClient(context)
+    private val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
     @SuppressLint("MissingPermission")
     override suspend fun getLocation(): LocationResult = withContext(Dispatchers.IO) {
+        // FusedLocationProvider returns null for several different reasons. Check the device
+        // providers first so SOS can accurately distinguish a disabled GPS/location service.
+        val hasEnabledProvider = runCatching {
+            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }.getOrDefault(true)
+        if (!hasEnabledProvider) return@withContext LocationResult.GpsDisabled
+
         val current = runCatching {
             Tasks.await(
                 client.getCurrentLocation(
