@@ -77,6 +77,7 @@ data class EmergencyEvent(
 interface CareOnRepository {
     suspend fun pair(pairingCode: String): Result<WearProfile>
     suspend fun restoreSession(): WearProfile? = null
+    fun clearSession() = Unit
     suspend fun measureHeartRate(bpm: Int): HeartRateReading
     suspend fun createEmergency(
         trigger: EmergencyTrigger,

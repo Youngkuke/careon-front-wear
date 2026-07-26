@@ -20,8 +20,7 @@ class SafeZoneEvaluator {
         else SafeZoneStatus.OUTSIDE_CANDIDATE
     }
 
-    fun forceDemoOutside(): SafeZoneStatus = SafeZoneStatus.OUTSIDE_CONFIRMED
-    private fun reset() { outsideCount = 0; firstOutsideAt = null }
+    fun reset() { outsideCount = 0; firstOutsideAt = null }
 
     companion object {
         fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {

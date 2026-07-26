@@ -9,6 +9,8 @@ import java.net.URL
 import java.time.Instant
 import java.util.UUID
 
+class WearSessionExpiredException : IllegalStateException("워치 연결이 만료됐어요. 새 연결 코드를 입력해주세요.")
+
 /** HTTP implementation of the agreed general-backend Wear API. API JSON stays snake_case here. */
 class RemoteCareOnRepository(context: Context) : CareOnRepository {
     private val preferences = context.getSharedPreferences("wear_session", Context.MODE_PRIVATE)
@@ -42,6 +44,10 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
             emergencyContactName = "보호자",
             heartRateCheckInThreshold = DEFAULT_HEART_RATE_THRESHOLD,
         )
+    }
+
+    override fun clearSession() {
+        preferences.edit().clear().apply()
     }
 
     override suspend fun measureHeartRate(bpm: Int) = HeartRateReading(bpm, Instant.now(), "WATCH")
@@ -113,7 +119,17 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
 
     private fun rawRequest(method: String, path: String, body: JSONObject?, idempotencyKey: String?, allowNoContent: Boolean): JSONObject? {
         var response = perform(method, path, body, idempotencyKey, preferences.getString(KEY_ACCESS_TOKEN, null))
-        if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED && refreshToken()) response = perform(method, path, body, idempotencyKey, preferences.getString(KEY_ACCESS_TOKEN, null))
+        if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
+            if (!refreshToken()) {
+                clearSession()
+                throw WearSessionExpiredException()
+            }
+            response = perform(method, path, body, idempotencyKey, preferences.getString(KEY_ACCESS_TOKEN, null))
+            if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                clearSession()
+                throw WearSessionExpiredException()
+            }
+        }
         if (response.code == HttpURLConnection.HTTP_NO_CONTENT && allowNoContent) return null
         if (response.code !in 200..299) throw IllegalStateException(response.message)
         return JSONObject(response.body)
