@@ -11,6 +11,7 @@ import com.careon.wear.data.EmergencyTrigger
 import com.careon.wear.data.HeartRateAssessment
 import com.careon.wear.data.HeartRateReading
 import com.careon.wear.data.WearProfile
+import com.careon.wear.data.WearConnectionInfo
 import com.careon.wear.data.WearSessionExpiredException
 import com.careon.wear.data.assessHeartRate
 import com.careon.wear.data.LocationSnapshot
@@ -30,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.time.Duration
+import java.time.Instant
 
 enum class WearScreen {
     PAIRING,
@@ -42,6 +45,7 @@ enum class WearScreen {
     ACKNOWLEDGED,
     LOCATION_PERMISSION,
     SAFE_ZONE_EXIT,
+    SETTINGS,
 }
 
 data class CareOnWearUiState(
@@ -50,10 +54,14 @@ data class CareOnWearUiState(
     val pairingError: String? = null,
     val isPairing: Boolean = false,
     val profile: WearProfile? = null,
+    val connectionInfo: WearConnectionInfo? = null,
+    val isLoadingConnection: Boolean = false,
+    val isDisconnecting: Boolean = false,
     val isMeasuring: Boolean = false,
     val heartRatePermissionGranted: Boolean = false,
     val requestHeartRatePermission: Boolean = false,
     val latestReading: HeartRateReading? = null,
+    val nextAutomaticHeartRateAt: Instant? = null,
     val assessment: HeartRateAssessment? = null,
     val emergency: EmergencyEvent? = null,
     val actionError: String? = null,
@@ -77,19 +85,27 @@ class CareOnWearViewModel(
     private var liveLocationTrackingJob: Job? = null
     private var safeZoneMonitoringJob: Job? = null
     private var safeZoneResponseTimeoutJob: Job? = null
+    private var deviceStatusJob: Job? = null
     private var locationClient: CareOnLocationClient = DemoLocationClient()
     private var heartRateSensorClient: HeartRateSensorClient? = null
     private var heartRateTimeoutJob: Job? = null
     private val safeZoneEvaluator = SafeZoneEvaluator()
     private var monitoredZoneKey: String? = null
     private var departureConfirmed = false
+    private var batteryPercentProvider: (() -> Int?)? = null
 
     init {
         restoreSession()
     }
 
     fun setLocationClient(client: CareOnLocationClient) { locationClient = client }
-    fun setHeartRateSensorClient(client: HeartRateSensorClient) { heartRateSensorClient = client }
+    fun setHeartRateSensorClient(client: HeartRateSensorClient) {
+        heartRateSensorClient = client
+        // Session restoration can complete before Compose creates the sensor client.
+        // Re-evaluate the foreground sampler once the actual sensor is available.
+        startAutomaticHeartRateMeasurement()
+    }
+    fun setBatteryPercentProvider(provider: () -> Int?) { batteryPercentProvider = provider }
 
     private fun restoreSession() = viewModelScope.launch {
         repository.restoreSession()?.let { profile ->
@@ -102,6 +118,8 @@ class CareOnWearViewModel(
             startAutomaticHeartRateMeasurement()
             startLiveLocationTracking()
             loadSafeZone()
+            restoreActiveSafeZoneEvent()
+            startDeviceStatusReporting()
         }
     }
 
@@ -173,6 +191,8 @@ class CareOnWearViewModel(
                     startAutomaticHeartRateMeasurement()
                     startLiveLocationTracking()
                     loadSafeZone()
+                    restoreActiveSafeZoneEvent()
+                    startDeviceStatusReporting()
                 }
                 .onFailure { error ->
                     mutableState.update {
@@ -212,6 +232,7 @@ class CareOnWearViewModel(
         mutableState.update {
             it.copy(assessment = assessment, isMeasuring = false, latestReading = reading, screen = WearScreen.RESULT)
         }
+        recordHeartRate(reading)
     }
 
     private fun onHeartRateMeasurementError(message: String) {
@@ -226,10 +247,15 @@ class CareOnWearViewModel(
      */
     private fun startAutomaticHeartRateMeasurement() {
         automaticHeartRateJob?.cancel()
-        if (!state.value.heartRatePermissionGranted || heartRateSensorClient == null) return
+        if (!state.value.heartRatePermissionGranted || heartRateSensorClient == null) {
+            mutableState.update { it.copy(nextAutomaticHeartRateAt = null) }
+            return
+        }
 
         automaticHeartRateJob = viewModelScope.launch {
             while (true) {
+                val nextMeasurementAt = Instant.now().plusMillis(AUTOMATIC_HEART_RATE_INTERVAL_MILLIS)
+                mutableState.update { it.copy(nextAutomaticHeartRateAt = nextMeasurementAt) }
                 delay(AUTOMATIC_HEART_RATE_INTERVAL_MILLIS)
                 val profile = state.value.profile ?: continue
                 val sensor = heartRateSensorClient ?: continue
@@ -253,9 +279,65 @@ class CareOnWearViewModel(
                 screen = if (assessment == HeartRateAssessment.CHECK_IN && current.screen == WearScreen.HOME) WearScreen.CHECK_IN else current.screen,
             )
         }
+        recordHeartRate(reading)
+    }
+
+    /** Heart-rate storage is best effort: a temporary network failure must not block SOS/check-in. */
+    private fun recordHeartRate(reading: HeartRateReading) = viewModelScope.launch {
+        try {
+            repository.recordHeartRate(reading)
+        } catch (error: WearSessionExpiredException) {
+            handleExpiredSession(error)
+        } catch (_: Exception) {
+            // The next foreground sensor sample is sent again; never fabricate a reading locally.
+        }
+    }
+
+    /** Foreground report only: sufficient for the emulator demo and avoids a hidden background service. */
+    private fun startDeviceStatusReporting() {
+        deviceStatusJob?.cancel()
+        deviceStatusJob = viewModelScope.launch {
+            while (state.value.profile != null) {
+                batteryPercentProvider?.invoke()?.let { percent ->
+                    try { repository.reportDeviceStatus(percent) }
+                    catch (error: WearSessionExpiredException) { handleExpiredSession(error); return@launch }
+                    catch (_: Exception) { /* retry on the next 15-minute foreground report */ }
+                }
+                delay(DEVICE_STATUS_REPORT_INTERVAL_MILLIS)
+            }
+        }
     }
 
     fun openCheckIn() = mutableState.update { it.copy(screen = WearScreen.CHECK_IN) }
+
+    fun openSettings() {
+        mutableState.update { it.copy(screen = WearScreen.SETTINGS, actionError = null) }
+        viewModelScope.launch {
+            mutableState.update { it.copy(isLoadingConnection = true) }
+            try {
+                val info = repository.getConnectionInfo()
+                mutableState.update { it.copy(connectionInfo = info, isLoadingConnection = false) }
+            } catch (error: WearSessionExpiredException) {
+                handleExpiredSession(error)
+            } catch (error: Exception) {
+                mutableState.update { it.copy(isLoadingConnection = false, actionError = error.message ?: "연결 정보를 불러오지 못했어요.") }
+            }
+        }
+    }
+
+    fun disconnectWear() = viewModelScope.launch {
+        mutableState.update { it.copy(isDisconnecting = true, actionError = null) }
+        try {
+            repository.disconnectWear()
+            clearLocalConnection("연결이 해제됐어요.\n새 연결 코드를 입력해주세요.")
+        } catch (error: WearSessionExpiredException) {
+            // DELETE invalidates this token. A retry after a network timeout therefore returns
+            // 401 even when the server already completed the disconnect successfully.
+            clearLocalConnection("연결이 해제됐어요.\n새 연결 코드를 입력해주세요.")
+        } catch (error: Exception) {
+            mutableState.update { it.copy(isDisconnecting = false, actionError = error.message ?: "연결을 해제하지 못했어요.") }
+        }
+    }
 
     fun sayOkay() = mutableState.update {
         it.copy(screen = WearScreen.HOME, assessment = null, actionError = null)
@@ -292,11 +374,25 @@ class CareOnWearViewModel(
 
         liveLocationTrackingJob = viewModelScope.launch {
             while (true) {
-                val tracking = runCatching { repository.getLiveLocationTracking() }.getOrNull()
+                val tracking = try {
+                    repository.getLiveLocationTracking()
+                } catch (error: WearSessionExpiredException) {
+                    handleExpiredSession(error)
+                    return@launch
+                } catch (_: Exception) {
+                    null
+                }
                 if (tracking?.enabled == true) {
                     val location = (locationClient.getLocation() as? LocationResult.Available)?.snapshot
                     if (location != null) {
-                        runCatching { repository.uploadLiveLocation(location) }
+                        try {
+                            repository.uploadLiveLocation(location)
+                        } catch (error: WearSessionExpiredException) {
+                            handleExpiredSession(error)
+                            return@launch
+                        } catch (_: Exception) {
+                            // The next configured interval retries transient upload failures.
+                        }
                         mutableState.update {
                             it.copy(
                                 latestLocation = location,
@@ -312,24 +408,39 @@ class CareOnWearViewModel(
     }
 
     private fun loadSafeZone() = viewModelScope.launch {
-        val zone = runCatching { repository.getSafeZone() }.getOrNull()
+        val zone = try {
+            repository.getSafeZone()
+        } catch (error: WearSessionExpiredException) {
+            handleExpiredSession(error)
+            return@launch
+        } catch (_: Exception) {
+            null
+        }
         updateSafeZone(zone)
         startSafeZoneMonitoring()
     }
 
     /**
-     * Foreground-only automatic departure detection. A location is sampled every 15 seconds;
-     * SafeZoneEvaluator confirms only after two outside samples spanning at least 30 seconds.
+     * Foreground-only automatic departure detection. A location is sampled every 10 seconds;
+     * SafeZoneEvaluator confirms only after two outside samples spanning at least 10 seconds.
      * A confirmed departure is latched until the watch returns inside, preventing duplicate
      * server events for the same trip outside the zone.
      */
     private fun startSafeZoneMonitoring() {
         safeZoneMonitoringJob?.cancel()
+        deviceStatusJob?.cancel()
         if (!state.value.locationGranted || state.value.profile == null) return
 
         safeZoneMonitoringJob = viewModelScope.launch {
             while (true) {
-                val zone = runCatching { repository.getSafeZone() }.getOrNull()
+                val zone = try {
+                    repository.getSafeZone()
+                } catch (error: WearSessionExpiredException) {
+                    handleExpiredSession(error)
+                    return@launch
+                } catch (_: Exception) {
+                    null
+                }
                 updateSafeZone(zone)
                 if (zone?.enabled == true) {
                     when (val locationResult = locationClient.getLocation()) {
@@ -379,6 +490,10 @@ class CareOnWearViewModel(
                     startSafeZoneResponseTimeout(event)
                 }
                 .onFailure { error ->
+                    if (error is WearSessionExpiredException) {
+                        handleExpiredSession(error)
+                        return@onFailure
+                    }
                     // Permit another confirmed sampling cycle after a transport failure.
                     departureConfirmed = false
                     mutableState.update { it.copy(actionError = error.message ?: "안심 구역 이탈을 알리지 못했어요.") }
@@ -388,24 +503,65 @@ class CareOnWearViewModel(
 
     private fun startSafeZoneResponseTimeout(event: SafeZoneEvent) {
         safeZoneResponseTimeoutJob?.cancel()
+        deviceStatusJob?.cancel()
         safeZoneResponseTimeoutJob = viewModelScope.launch {
-            delay(SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS)
+            val delayMillis = event.responseDeadlineAt?.let { deadline ->
+                Duration.between(java.time.Instant.now(), deadline).toMillis().coerceAtLeast(0L)
+            } ?: SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS
+            delay(delayMillis)
             if (state.value.screen == WearScreen.SAFE_ZONE_EXIT && state.value.safeZoneEvent?.id == event.id) {
-                runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NO_RESPONSE) }
+                try {
+                    repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NO_RESPONSE)
+                } catch (error: WearSessionExpiredException) {
+                    handleExpiredSession(error)
+                    return@launch
+                } catch (_: Exception) {
+                    // The event remains on the server; UI state still returns home on timeout.
+                }
                 mutableState.update { it.copy(screen = WearScreen.HOME, safeZoneStatus = SafeZoneStatus.NO_RESPONSE) }
             }
         }
     }
 
+    /** Restores a pending server event after the watch process is recreated; server owns the deadline. */
+    private fun restoreActiveSafeZoneEvent() = viewModelScope.launch {
+        try {
+            val event = repository.getActiveSafeZoneEvent() ?: return@launch
+            mutableState.update { it.copy(screen = WearScreen.SAFE_ZONE_EXIT, safeZoneEvent = event, safeZoneStatus = event.status) }
+            startSafeZoneResponseTimeout(event)
+        } catch (error: WearSessionExpiredException) {
+            handleExpiredSession(error)
+        } catch (_: Exception) {
+            // Safe-zone monitoring itself remains available; restoration can retry on the next launch.
+        }
+    }
+
     fun confirmSafeZoneOkay() {
         val event = state.value.safeZoneEvent
-        if (event != null) viewModelScope.launch { runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.USER_OKAY) } }
+        if (event != null) viewModelScope.launch {
+            try {
+                repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.USER_OKAY)
+            } catch (error: WearSessionExpiredException) {
+                handleExpiredSession(error)
+            } catch (_: Exception) {
+                mutableState.update { it.copy(actionError = "응답을 보내지 못했어요. 다시 시도해주세요.") }
+            }
+        }
         safeZoneResponseTimeoutJob?.cancel()
         mutableState.update { it.copy(screen = WearScreen.HOME, safeZoneStatus = SafeZoneStatus.USER_OKAY) }
     }
 
     fun requestHelpFromSafeZone() {
-        state.value.safeZoneEvent?.let { event -> viewModelScope.launch { runCatching { repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NEED_HELP) } } }
+        state.value.safeZoneEvent?.let { event -> viewModelScope.launch {
+            try {
+                repository.respondToSafeZoneEvent(event.id, SafeZoneStatus.NEED_HELP)
+            } catch (error: WearSessionExpiredException) {
+                handleExpiredSession(error)
+                return@launch
+            } catch (_: Exception) {
+                mutableState.update { it.copy(actionError = "응답을 보내지 못했어요. 긴급 도움 요청은 계속 시도할 수 있어요.") }
+            }
+        } }
         safeZoneResponseTimeoutJob?.cancel()
         createEmergency(EmergencyTrigger.MANUAL_SOS, state.value.latestReading?.bpm)
     }
@@ -427,6 +583,10 @@ class CareOnWearViewModel(
                     pollEmergency(event.id)
                 }
                 .onFailure { error ->
+                    if (error is WearSessionExpiredException) {
+                        handleExpiredSession(error)
+                        return@onFailure
+                    }
                     mutableState.update { it.copy(actionError = error.message ?: "도움 요청을 보내지 못했어요.") }
                 }
         }
@@ -434,7 +594,6 @@ class CareOnWearViewModel(
 
     private fun pollEmergency(eventId: String) {
         emergencyPollingJob?.cancel()
-        automaticHeartRateJob?.cancel()
         emergencyPollingJob = viewModelScope.launch {
             var retryDelayMillis = EMERGENCY_POLL_INTERVAL_MILLIS
             while (true) {
@@ -464,16 +623,30 @@ class CareOnWearViewModel(
         emergencyPollingJob?.cancel()
         liveLocationTrackingJob?.cancel()
         safeZoneMonitoringJob?.cancel()
+        clearLocalConnection(error.message ?: "워치 연결이 만료됐어요.\n새 연결 코드를 입력해주세요.")
+    }
+
+    private fun clearLocalConnection(message: String) {
+        emergencyPollingJob?.cancel()
+        automaticHeartRateJob?.cancel()
+        liveLocationTrackingJob?.cancel()
+        safeZoneMonitoringJob?.cancel()
+        safeZoneResponseTimeoutJob?.cancel()
+        deviceStatusJob?.cancel()
         repository.clearSession()
         mutableState.update {
             it.copy(
                 screen = WearScreen.PAIRING,
                 profile = null,
                 pairingCode = "",
-                pairingError = error.message,
+                pairingError = message,
                 emergency = null,
                 safeZone = null,
                 safeZoneEvent = null,
+                connectionInfo = null,
+                isLoadingConnection = false,
+                isDisconnecting = false,
+                nextAutomaticHeartRateAt = null,
             )
         }
     }
@@ -483,6 +656,10 @@ class CareOnWearViewModel(
         mutableState.update {
             it.copy(screen = WearScreen.HOME, assessment = null, emergency = null, actionError = null)
         }
+    }
+
+    fun dismissError() {
+        mutableState.update { it.copy(pairingError = null, actionError = null) }
     }
 
     override fun onCleared() {
@@ -496,13 +673,14 @@ class CareOnWearViewModel(
     }
 
     private companion object {
-        const val AUTOMATIC_HEART_RATE_INTERVAL_MILLIS = 30_000L
+        const val AUTOMATIC_HEART_RATE_INTERVAL_MILLIS = 10_000L
         const val SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS = 30_000L
-        const val SAFE_ZONE_SAMPLE_INTERVAL_MILLIS = 15_000L
+        const val SAFE_ZONE_SAMPLE_INTERVAL_MILLIS = 10_000L
         const val MAX_SAFE_ZONE_ACCURACY_METERS = 100f
         const val LIVE_LOCATION_STATUS_RETRY_SECONDS = 10
         const val EMERGENCY_POLL_INTERVAL_MILLIS = 1_000L
         const val MAX_EMERGENCY_POLL_RETRY_MILLIS = 16_000L
+        const val DEVICE_STATUS_REPORT_INTERVAL_MILLIS = 15 * 60_000L
     }
 }
 
