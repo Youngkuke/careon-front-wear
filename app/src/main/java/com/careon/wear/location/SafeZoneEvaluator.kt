@@ -16,7 +16,7 @@ class SafeZoneEvaluator {
         if (distance <= zone.radiusMeters + margin) { reset(); return SafeZoneStatus.INSIDE }
         outsideCount += 1
         if (firstOutsideAt == null) firstOutsideAt = location.capturedAt.toEpochMilli()
-        return if (outsideCount >= 2 && location.capturedAt.toEpochMilli() - firstOutsideAt!! >= 30_000) SafeZoneStatus.OUTSIDE_CONFIRMED
+        return if (outsideCount >= 2 && location.capturedAt.toEpochMilli() - firstOutsideAt!! >= 10_000) SafeZoneStatus.OUTSIDE_CONFIRMED
         else SafeZoneStatus.OUTSIDE_CANDIDATE
     }
 
