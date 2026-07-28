@@ -9,7 +9,7 @@ import java.net.URL
 import java.time.Instant
 import java.util.UUID
 
-class WearSessionExpiredException : IllegalStateException("워치 연결이 만료됐어요. 새 연결 코드를 입력해주세요.")
+class WearSessionExpiredException : IllegalStateException("워치 연결이 만료됐어요.\n새 연결 코드를 입력해주세요.")
 
 /** HTTP implementation of the agreed general-backend Wear API. API JSON stays snake_case here. */
 class RemoteCareOnRepository(context: Context) : CareOnRepository {
@@ -50,7 +50,27 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
         preferences.edit().clear().apply()
     }
 
+    override suspend fun getConnectionInfo(): WearConnectionInfo {
+        val response = request("GET", "/api/wear/connection")
+        val carer = response.getJSONObject("carer")
+        return WearConnectionInfo(
+            carerName = carer.getString("name"),
+            carerEmail = carer.getString("email"),
+            deviceName = response.optString("device_name", "CareOn 워치"),
+        )
+    }
+
+    override suspend fun disconnectWear() {
+        withContext(Dispatchers.IO) {
+        rawRequest("DELETE", "/api/wear/connection", null, null, allowNoContent = true)
+        }
+    }
+
     override suspend fun measureHeartRate(bpm: Int) = HeartRateReading(bpm, Instant.now(), "WATCH")
+
+    override suspend fun recordHeartRate(reading: HeartRateReading) {
+        request("POST", "/api/wear/heart-rates", JSONObject().put("bpm", reading.bpm).put("measured_at", reading.measuredAt.toString()).put("source", reading.source), UUID.randomUUID().toString())
+    }
 
     override suspend fun createEmergency(trigger: EmergencyTrigger, heartRateBpm: Int?, location: LocationSnapshot?, locationStatus: LocationStatus): EmergencyEvent {
         val body = JSONObject()
@@ -80,6 +100,17 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
         return SafeZone(response.getLong("safe_zone_id"), response.getString("name"), response.getDouble("latitude"), response.getDouble("longitude"), response.getDouble("radius_meters"), response.getBoolean("enabled"))
     }
 
+    override suspend fun getActiveSafeZoneEvent(): SafeZoneEvent? {
+        val response = requestAllowNoContent("GET", "/api/wear/safe-zone-events/active") ?: return null
+        val location = response.getJSONObject("location")
+        return SafeZoneEvent(
+            id = response.getLong("event_id").toString(),
+            status = SafeZoneStatus.valueOf(response.getString("status")),
+            location = LocationSnapshot(location.getDouble("latitude"), location.getDouble("longitude"), location.optDouble("accuracy_meters", 0.0).toFloat(), Instant.parse(location.getString("captured_at")), LocationSource.CURRENT),
+            responseDeadlineAt = response.optString("response_deadline_at").takeIf { it.isNotBlank() }?.let(Instant::parse),
+        )
+    }
+
     override suspend fun createSafeZoneEvent(status: SafeZoneStatus, location: LocationSnapshot): SafeZoneEvent {
         val zone = getSafeZone() ?: error("활성 안심 구역이 없어요.")
         val body = JSONObject()
@@ -88,7 +119,7 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
             .put("detected_at", Instant.now().toString())
             .put("location", location.toSafeZoneJson())
         val response = request("POST", "/api/wear/safe-zone-events", body, UUID.randomUUID().toString())
-        return SafeZoneEvent(response.getLong("event_id").toString(), SafeZoneStatus.valueOf(response.getString("status")), location)
+        return SafeZoneEvent(response.getLong("event_id").toString(), SafeZoneStatus.valueOf(response.getString("status")), location, response.optString("response_deadline_at").takeIf { it.isNotBlank() }?.let(Instant::parse))
     }
 
     override suspend fun respondToSafeZoneEvent(eventId: String, response: SafeZoneStatus): SafeZoneEvent {
@@ -107,6 +138,10 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
 
     override suspend fun uploadLiveLocation(location: LocationSnapshot) {
         request("POST", "/api/wear/live-location", location.toLiveLocationJson())
+    }
+
+    override suspend fun reportDeviceStatus(batteryPercent: Int, reportedAt: Instant) {
+        request("POST", "/api/wear/device-status", JSONObject().put("battery_percent", batteryPercent.coerceIn(0, 100)).put("reported_at", reportedAt.toString()))
     }
 
     private suspend fun request(method: String, path: String, body: JSONObject? = null, idempotencyKey: String? = null): JSONObject = withContext(Dispatchers.IO) {

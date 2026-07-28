@@ -26,7 +26,7 @@ data class SafeZone(
 
 enum class SafeZoneStatus { UNKNOWN, INSIDE, OUTSIDE_CANDIDATE, OUTSIDE_CONFIRMED, USER_OKAY, NEED_HELP, NO_RESPONSE }
 
-data class SafeZoneEvent(val id: String, val status: SafeZoneStatus, val location: LocationSnapshot)
+data class SafeZoneEvent(val id: String, val status: SafeZoneStatus, val location: LocationSnapshot, val responseDeadlineAt: Instant? = null)
 
 data class LiveLocationTracking(
     val enabled: Boolean,
@@ -39,6 +39,8 @@ data class WearProfile(
     val emergencyContactName: String,
     val heartRateCheckInThreshold: Int,
 )
+
+data class WearConnectionInfo(val carerName: String, val carerEmail: String, val deviceName: String)
 
 data class HeartRateReading(
     val bpm: Int,
@@ -78,7 +80,10 @@ interface CareOnRepository {
     suspend fun pair(pairingCode: String): Result<WearProfile>
     suspend fun restoreSession(): WearProfile? = null
     fun clearSession() = Unit
+    suspend fun getConnectionInfo(): WearConnectionInfo? = null
+    suspend fun disconnectWear() = Unit
     suspend fun measureHeartRate(bpm: Int): HeartRateReading
+    suspend fun recordHeartRate(reading: HeartRateReading) = Unit
     suspend fun createEmergency(
         trigger: EmergencyTrigger,
         heartRateBpm: Int?,
@@ -88,12 +93,14 @@ interface CareOnRepository {
 
     suspend fun getEmergency(eventId: String): EmergencyEvent
     suspend fun getSafeZone(): SafeZone? = null
+    suspend fun getActiveSafeZoneEvent(): SafeZoneEvent? = null
     suspend fun createSafeZoneEvent(status: SafeZoneStatus, location: LocationSnapshot): SafeZoneEvent =
         SafeZoneEvent(UUID.randomUUID().toString(), status, location)
     suspend fun respondToSafeZoneEvent(eventId: String, response: SafeZoneStatus): SafeZoneEvent =
         throw UnsupportedOperationException("Not implemented")
     suspend fun getLiveLocationTracking(): LiveLocationTracking = LiveLocationTracking(enabled = false)
     suspend fun uploadLiveLocation(location: LocationSnapshot) = Unit
+    suspend fun reportDeviceStatus(batteryPercent: Int, reportedAt: Instant = Instant.now()) = Unit
 }
 
 /**
