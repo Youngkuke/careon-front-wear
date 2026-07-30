@@ -89,6 +89,9 @@ class CareOnWearViewModel(
     private var locationClient: CareOnLocationClient = DemoLocationClient()
     private var heartRateSensorClient: HeartRateSensorClient? = null
     private var heartRateTimeoutJob: Job? = null
+    private var heartRateCheckInTimeoutJob: Job? = null
+    private var pendingHeartRateCheckInReading: HeartRateReading? = null
+    private var automaticHeartRateCheckInsSuppressedUntil: Instant? = null
     private val safeZoneEvaluator = SafeZoneEvaluator()
     private var monitoredZoneKey: String? = null
     private var departureConfirmed = false
@@ -203,7 +206,7 @@ class CareOnWearViewModel(
     }
 
     fun measureHeartRate() {
-        val profile = state.value.profile ?: return
+        if (state.value.profile == null) return
         if (!state.value.heartRatePermissionGranted) {
             mutableState.update { it.copy(requestHeartRatePermission = true, actionError = null) }
             return
@@ -215,7 +218,7 @@ class CareOnWearViewModel(
         }
         mutableState.update { it.copy(isMeasuring = true, screen = WearScreen.MEASURING, actionError = null) }
         sensor.requestReading(
-            onReading = { bpm -> onHeartRateReading(bpm, profile) },
+            onReading = ::onHeartRateReading,
             onError = ::onHeartRateMeasurementError,
         )
         heartRateTimeoutJob?.cancel()
@@ -225,14 +228,18 @@ class CareOnWearViewModel(
         }
     }
 
-    private fun onHeartRateReading(bpm: Int, profile: WearProfile) {
+    private fun onHeartRateReading(bpm: Int) {
         heartRateTimeoutJob?.cancel()
         val reading = HeartRateReading(bpm = bpm, measuredAt = java.time.Instant.now(), source = "WATCH_SENSOR")
-        val assessment = assessHeartRate(reading.bpm, profile.heartRateCheckInThreshold)
-        mutableState.update {
-            it.copy(assessment = assessment, isMeasuring = false, latestReading = reading, screen = WearScreen.RESULT)
-        }
+        val assessment = assessHeartRate(reading.bpm)
         recordHeartRate(reading)
+        when (assessment) {
+            HeartRateAssessment.NORMAL -> mutableState.update {
+                it.copy(assessment = assessment, isMeasuring = false, latestReading = reading, screen = WearScreen.RESULT)
+            }
+            HeartRateAssessment.CHECK_IN -> enterHeartRateCheckIn(reading)
+            HeartRateAssessment.CRITICAL -> sendCriticalHeartRateEmergency(reading)
+        }
     }
 
     private fun onHeartRateMeasurementError(message: String) {
@@ -257,10 +264,13 @@ class CareOnWearViewModel(
                 val nextMeasurementAt = Instant.now().plusMillis(AUTOMATIC_HEART_RATE_INTERVAL_MILLIS)
                 mutableState.update { it.copy(nextAutomaticHeartRateAt = nextMeasurementAt) }
                 delay(AUTOMATIC_HEART_RATE_INTERVAL_MILLIS)
-                val profile = state.value.profile ?: continue
+                if (
+                    state.value.profile == null ||
+                    state.value.screen != WearScreen.HOME
+                ) continue
                 val sensor = heartRateSensorClient ?: continue
                 sensor.requestReading(
-                    onReading = { bpm -> onAutomaticHeartRateReading(bpm, profile) },
+                    onReading = ::onAutomaticHeartRateReading,
                     // A sensor can legitimately have no fresh value in this interval. Keep the
                     // previous reading and try again next cycle without interrupting the user.
                     onError = {},
@@ -269,17 +279,65 @@ class CareOnWearViewModel(
         }
     }
 
-    private fun onAutomaticHeartRateReading(bpm: Int, profile: WearProfile) {
+    private fun onAutomaticHeartRateReading(bpm: Int) {
         val reading = HeartRateReading(bpm = bpm, measuredAt = java.time.Instant.now(), source = "WATCH_SENSOR")
-        val assessment = assessHeartRate(reading.bpm, profile.heartRateCheckInThreshold)
+        val assessment = assessHeartRate(reading.bpm)
+        val currentScreen = state.value.screen
         mutableState.update { current ->
             current.copy(
                 latestReading = reading,
                 assessment = assessment,
-                screen = if (assessment == HeartRateAssessment.CHECK_IN && current.screen == WearScreen.HOME) WearScreen.CHECK_IN else current.screen,
             )
         }
         recordHeartRate(reading)
+        val checkInSuppressed = automaticHeartRateCheckInsSuppressedUntil?.let { Instant.now().isBefore(it) } == true
+        when {
+            assessment == HeartRateAssessment.CRITICAL && currentScreen == WearScreen.HOME ->
+                sendCriticalHeartRateEmergency(reading)
+            assessment == HeartRateAssessment.CHECK_IN && currentScreen == WearScreen.HOME && !checkInSuppressed ->
+                enterHeartRateCheckIn(reading)
+        }
+    }
+
+    private fun sendCriticalHeartRateEmergency(reading: HeartRateReading) {
+        heartRateCheckInTimeoutJob?.cancel()
+        pendingHeartRateCheckInReading = null
+        mutableState.update {
+            it.copy(
+                assessment = HeartRateAssessment.CRITICAL,
+                isMeasuring = false,
+                latestReading = reading,
+                actionError = null,
+            )
+        }
+        createEmergency(
+            trigger = EmergencyTrigger.HEART_RATE_CHECK_IN,
+            heartRateBpm = reading.bpm,
+            failureScreen = WearScreen.HOME,
+        )
+    }
+
+    private fun enterHeartRateCheckIn(reading: HeartRateReading) {
+        heartRateCheckInTimeoutJob?.cancel()
+        pendingHeartRateCheckInReading = reading
+        mutableState.update {
+            it.copy(
+                assessment = HeartRateAssessment.CHECK_IN,
+                isMeasuring = false,
+                latestReading = reading,
+                screen = WearScreen.CHECK_IN,
+            )
+        }
+        heartRateCheckInTimeoutJob = viewModelScope.launch {
+            delay(HEART_RATE_CHECK_IN_TIMEOUT_MILLIS)
+            if (
+                state.value.screen == WearScreen.CHECK_IN &&
+                pendingHeartRateCheckInReading?.measuredAt == reading.measuredAt
+            ) {
+                pendingHeartRateCheckInReading = null
+                createEmergency(EmergencyTrigger.HEART_RATE_CHECK_IN, reading.bpm)
+            }
+        }
     }
 
     /** Heart-rate storage is best effort: a temporary network failure must not block SOS/check-in. */
@@ -308,7 +366,9 @@ class CareOnWearViewModel(
         }
     }
 
-    fun openCheckIn() = mutableState.update { it.copy(screen = WearScreen.CHECK_IN) }
+    fun openCheckIn() {
+        state.value.latestReading?.let(::enterHeartRateCheckIn)
+    }
 
     fun openSettings() {
         mutableState.update { it.copy(screen = WearScreen.SETTINGS, actionError = null) }
@@ -339,8 +399,13 @@ class CareOnWearViewModel(
         }
     }
 
-    fun sayOkay() = mutableState.update {
-        it.copy(screen = WearScreen.HOME, assessment = null, actionError = null)
+    fun sayOkay() {
+        heartRateCheckInTimeoutJob?.cancel()
+        pendingHeartRateCheckInReading = null
+        suppressAutomaticHeartRateCheckIns()
+        mutableState.update {
+            it.copy(screen = WearScreen.HOME, assessment = null, actionError = null)
+        }
     }
 
     fun openSos() = mutableState.update { it.copy(screen = WearScreen.SOS, actionError = null) }
@@ -567,18 +632,26 @@ class CareOnWearViewModel(
     }
 
     fun requestHelpFromHeartRate() {
-        createEmergency(EmergencyTrigger.HEART_RATE_CHECK_IN, state.value.latestReading?.bpm)
+        heartRateCheckInTimeoutJob?.cancel()
+        val reading = pendingHeartRateCheckInReading ?: state.value.latestReading
+        pendingHeartRateCheckInReading = null
+        createEmergency(EmergencyTrigger.HEART_RATE_CHECK_IN, reading?.bpm)
     }
 
     fun requestManualSos() {
         createEmergency(EmergencyTrigger.MANUAL_SOS, state.value.latestReading?.bpm)
     }
 
-    private fun createEmergency(trigger: EmergencyTrigger, heartRateBpm: Int?) {
-        mutableState.update { it.copy(actionError = null) }
+    private fun createEmergency(
+        trigger: EmergencyTrigger,
+        heartRateBpm: Int?,
+        failureScreen: WearScreen = state.value.screen,
+    ) {
+        mutableState.update { it.copy(actionError = null, screen = WearScreen.WAITING) }
         viewModelScope.launch {
             runCatching { repository.createEmergency(trigger, heartRateBpm, state.value.latestLocation, state.value.locationStatus) }
                 .onSuccess { event ->
+                    if (trigger == EmergencyTrigger.HEART_RATE_CHECK_IN) suppressAutomaticHeartRateCheckIns()
                     mutableState.update { it.copy(emergency = event, screen = WearScreen.WAITING) }
                     pollEmergency(event.id)
                 }
@@ -587,7 +660,12 @@ class CareOnWearViewModel(
                         handleExpiredSession(error)
                         return@onFailure
                     }
-                    mutableState.update { it.copy(actionError = error.message ?: "도움 요청을 보내지 못했어요.") }
+                    mutableState.update {
+                        it.copy(
+                            actionError = error.message ?: "도움 요청을 보내지 못했어요.",
+                            screen = failureScreen,
+                        )
+                    }
                 }
         }
     }
@@ -632,7 +710,10 @@ class CareOnWearViewModel(
         liveLocationTrackingJob?.cancel()
         safeZoneMonitoringJob?.cancel()
         safeZoneResponseTimeoutJob?.cancel()
+        heartRateCheckInTimeoutJob?.cancel()
         deviceStatusJob?.cancel()
+        pendingHeartRateCheckInReading = null
+        automaticHeartRateCheckInsSuppressedUntil = null
         repository.clearSession()
         mutableState.update {
             it.copy(
@@ -653,6 +734,8 @@ class CareOnWearViewModel(
 
     fun returnHome() {
         emergencyPollingJob?.cancel()
+        heartRateCheckInTimeoutJob?.cancel()
+        pendingHeartRateCheckInReading = null
         mutableState.update {
             it.copy(screen = WearScreen.HOME, assessment = null, emergency = null, actionError = null)
         }
@@ -662,9 +745,14 @@ class CareOnWearViewModel(
         mutableState.update { it.copy(pairingError = null, actionError = null) }
     }
 
+    private fun suppressAutomaticHeartRateCheckIns() {
+        automaticHeartRateCheckInsSuppressedUntil = Instant.now().plusMillis(HEART_RATE_CHECK_IN_COOLDOWN_MILLIS)
+    }
+
     override fun onCleared() {
         emergencyPollingJob?.cancel()
         heartRateTimeoutJob?.cancel()
+        heartRateCheckInTimeoutJob?.cancel()
         liveLocationTrackingJob?.cancel()
         safeZoneMonitoringJob?.cancel()
         safeZoneResponseTimeoutJob?.cancel()
@@ -674,6 +762,8 @@ class CareOnWearViewModel(
 
     private companion object {
         const val AUTOMATIC_HEART_RATE_INTERVAL_MILLIS = 10_000L
+        const val HEART_RATE_CHECK_IN_COOLDOWN_MILLIS = 60_000L
+        const val HEART_RATE_CHECK_IN_TIMEOUT_MILLIS = 30_000L
         const val SAFE_ZONE_RESPONSE_TIMEOUT_MILLIS = 30_000L
         const val SAFE_ZONE_SAMPLE_INTERVAL_MILLIS = 10_000L
         const val MAX_SAFE_ZONE_ACCURACY_METERS = 100f

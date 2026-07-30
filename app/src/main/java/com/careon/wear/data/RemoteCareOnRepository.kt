@@ -30,7 +30,6 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
             // The service intentionally does not collect a care recipient's name.
             displayName = cared.optString("cared_relation", "돌봄 대상자"),
             emergencyContactName = "보호자",
-            heartRateCheckInThreshold = DEFAULT_HEART_RATE_THRESHOLD,
         )
     }
 
@@ -42,7 +41,6 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
             caredId = caredId,
             displayName = preferences.getString(KEY_CARED_RELATION, null) ?: "돌봄 대상자",
             emergencyContactName = "보호자",
-            heartRateCheckInThreshold = DEFAULT_HEART_RATE_THRESHOLD,
         )
     }
 
@@ -203,7 +201,6 @@ class RemoteCareOnRepository(context: Context) : CareOnRepository {
         const val KEY_CARED_ID = "cared_id"
         const val KEY_CARED_RELATION = "cared_relation"
         const val NO_CARED_ID = -1L
-        const val DEFAULT_HEART_RATE_THRESHOLD = 110
         const val DEFAULT_LIVE_LOCATION_INTERVAL_SECONDS = 10
         const val MINIMUM_LIVE_LOCATION_INTERVAL_SECONDS = 5
         const val MAXIMUM_LIVE_LOCATION_INTERVAL_SECONDS = 60

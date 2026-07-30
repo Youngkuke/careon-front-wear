@@ -170,6 +170,7 @@ fun CareOnWearApp(repository: CareOnRepository? = null) {
                 )
 
                 WearScreen.CHECK_IN -> CheckInScreen(
+                    bpm = state.latestReading?.bpm,
                     onOkay = viewModel::sayOkay,
                     onNeedHelp = viewModel::requestHelpFromHeartRate,
                 )
@@ -511,9 +512,20 @@ private fun ResultScreen(bpm: Int, assessment: HeartRateAssessment, onOkay: () -
 }
 
 @Composable
-private fun CheckInScreen(onOkay: () -> Unit, onNeedHelp: () -> Unit) {
+private fun CheckInScreen(bpm: Int?, onOkay: () -> Unit, onNeedHelp: () -> Unit) {
     val scale = LocalWearLayoutScale.current
     PageTitle("현재 상태를\n알려주세요")
+    if (bpm != null) {
+        Spacer(Modifier.height(scale.size(7.dp)))
+        Text("$bpm BPM", color = CareOnWearColors.Warning, fontWeight = FontWeight.Bold)
+    }
+    Spacer(Modifier.height(scale.size(5.dp)))
+    Text(
+        "30초 동안 응답이 없으면\n보호자에게 알려드려요",
+        color = CareOnWearColors.Muted,
+        style = MaterialTheme.typography.bodySmall,
+        textAlign = TextAlign.Center,
+    )
     Spacer(Modifier.height(scale.size(18.dp)))
     PrimaryButton("괜찮아요", onClick = onOkay)
     Spacer(Modifier.height(scale.size(8.dp)))
