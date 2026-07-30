@@ -5,9 +5,11 @@ import com.careon.wear.data.SafeZone
 import com.careon.wear.data.SafeZoneStatus
 import kotlin.math.*
 
-class SafeZoneEvaluator {
+class SafeZoneEvaluator(
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+) {
     private var outsideCount = 0
-    private var firstOutsideAt: Long? = null
+    private var firstOutsideEvaluatedAt: Long? = null
 
     fun evaluate(zone: SafeZone, location: LocationSnapshot): SafeZoneStatus {
         val distance = distanceMeters(zone.latitude, zone.longitude, location.latitude, location.longitude)
@@ -15,12 +17,13 @@ class SafeZoneEvaluator {
         val margin = max(location.accuracyMeters.toDouble(), 30.0)
         if (distance <= zone.radiusMeters + margin) { reset(); return SafeZoneStatus.INSIDE }
         outsideCount += 1
-        if (firstOutsideAt == null) firstOutsideAt = location.capturedAt.toEpochMilli()
-        return if (outsideCount >= 2 && location.capturedAt.toEpochMilli() - firstOutsideAt!! >= 10_000) SafeZoneStatus.OUTSIDE_CONFIRMED
+        val evaluatedAt = nowMillis()
+        if (firstOutsideEvaluatedAt == null) firstOutsideEvaluatedAt = evaluatedAt
+        return if (outsideCount >= 2 && evaluatedAt - firstOutsideEvaluatedAt!! >= 10_000) SafeZoneStatus.OUTSIDE_CONFIRMED
         else SafeZoneStatus.OUTSIDE_CANDIDATE
     }
 
-    fun reset() { outsideCount = 0; firstOutsideAt = null }
+    fun reset() { outsideCount = 0; firstOutsideEvaluatedAt = null }
 
     companion object {
         fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
