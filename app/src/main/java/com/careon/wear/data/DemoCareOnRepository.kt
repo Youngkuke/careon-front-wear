@@ -37,7 +37,6 @@ data class WearProfile(
     val caredId: Long,
     val displayName: String,
     val emergencyContactName: String,
-    val heartRateCheckInThreshold: Int,
 )
 
 data class WearConnectionInfo(val carerName: String, val carerEmail: String, val deviceName: String)
@@ -51,10 +50,14 @@ data class HeartRateReading(
 enum class HeartRateAssessment {
     NORMAL,
     CHECK_IN,
+    CRITICAL,
 }
 
-fun assessHeartRate(bpm: Int, threshold: Int): HeartRateAssessment =
-    if (bpm >= threshold) HeartRateAssessment.CHECK_IN else HeartRateAssessment.NORMAL
+fun assessHeartRate(bpm: Int): HeartRateAssessment = when {
+    bpm <= 40 || bpm >= 130 -> HeartRateAssessment.CRITICAL
+    bpm in 41..59 || bpm in 111..129 -> HeartRateAssessment.CHECK_IN
+    else -> HeartRateAssessment.NORMAL
+}
 
 enum class EmergencyTrigger {
     HEART_RATE_CHECK_IN,
@@ -112,7 +115,6 @@ class DemoCareOnRepository : CareOnRepository {
         caredId = 7,
         displayName = "어머니",
         emergencyContactName = "김보호",
-        heartRateCheckInThreshold = 110,
     )
     private val emergencies = mutableMapOf<String, EmergencyEvent>()
 
